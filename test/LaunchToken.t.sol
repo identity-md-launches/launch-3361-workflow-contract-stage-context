@@ -64,6 +64,28 @@ contract LaunchTokenTest is Test {
         assertEq(token.allowance(address(this), alice), type(uint256).max);
     }
 
+    function test_replacingUnlimitedApprovalOnlyChangesThatSpendersBudget() public {
+        token.approve(alice, type(uint256).max);
+        token.approve(bob, 4 ether);
+        token.approve(alice, 3 ether);
+        vm.startPrank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, alice, 3 ether, 4 ether)
+        );
+        token.transferFrom(address(this), alice, 4 ether);
+        assertTrue(token.transferFrom(address(this), alice, 3 ether));
+        vm.stopPrank();
+        assertEq(token.allowance(address(this), alice), 0);
+        assertEq(token.allowance(address(this), bob), 4 ether);
+
+        vm.prank(bob);
+        assertTrue(token.transferFrom(address(this), bob, 4 ether));
+        assertEq(token.allowance(address(this), bob), 0);
+        assertEq(token.balanceOf(alice), 3 ether);
+        assertEq(token.balanceOf(bob), 4 ether);
+        assertEq(token.balanceOf(address(this)), 1e27 - 7 ether);
+    }
+
     function test_transferFromWithoutApprovalReverts() public {
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, alice, 0, 1));

@@ -14,6 +14,8 @@ contract StakingHandler is Test {
     LaunchToken public immutable token;
     TestStaking public immutable staking;
     address[4] public actors;
+    // Each actor's TEST in their wallet and in custody combined.
+    uint256[4] public modelHoldings;
     uint256[4] public modelStake;
     uint256[4] public modelPointsLower;
     uint256[4] public modelPointsUpper;
@@ -22,28 +24,31 @@ contract StakingHandler is Test {
     uint256 public modelEmitted;
     uint256 public donations;
     uint256 public distributionChanges;
+    uint256 public discardedScaledPoints;
+    uint256 private emissionAtStakeChange;
 
     constructor(LaunchToken token_) {
         token = token_;
         staking = new TestStaking(address(token_), address(this));
         for (uint256 i; i < 4; ++i) {
             actors[i] = makeAddr(string.concat("actor", vm.toString(i)));
+            modelHoldings[i] = ALLOCATION;
         }
     }
 
     function stake(uint256 actorSeed, uint256 rawAmount) external {
         uint256 i = actorSeed % 4;
         address actor = actors[i];
-        uint256 available = token.balanceOf(actor);
+        uint256 available = modelHoldings[i] - modelStake[i];
         if (available == 0) return;
         uint256 amount = bound(rawAmount, 1, available);
         vm.startPrank(actor);
         token.approve(address(staking), amount);
         staking.stake(amount);
         vm.stopPrank();
+        _closeStakeInterval();
         modelStake[i] += amount;
         modelTotal += amount;
-        ++distributionChanges;
     }
 
     function withdraw(uint256 actorSeed, uint256 rawAmount) external {
@@ -53,9 +58,9 @@ contract StakingHandler is Test {
         uint256 amount = bound(rawAmount, 1, available);
         vm.prank(actors[i]);
         staking.withdraw(amount);
+        _closeStakeInterval();
         modelStake[i] -= amount;
         modelTotal -= amount;
-        ++distributionChanges;
     }
 
     function advance(uint256 rawElapsed) external {
@@ -94,15 +99,35 @@ contract StakingHandler is Test {
         donations += amount;
     }
 
+    function transfer(uint256 senderSeed, uint256 recipientSeed, uint256 rawAmount) external {
+        uint256 from = senderSeed % 4;
+        uint256 to = recipientSeed % 4;
+        uint256 amount = bound(rawAmount, 0, modelHoldings[from] - modelStake[from]);
+        vm.prank(actors[from]);
+        assertTrue(token.transfer(actors[to], amount));
+        modelHoldings[from] -= amount;
+        modelHoldings[to] += amount;
+    }
+
     function exitAll() external {
         for (uint256 i; i < 4; ++i) {
             if (modelStake[i] == 0) continue;
             vm.prank(actors[i]);
             staking.withdraw(modelStake[i]);
+            _closeStakeInterval();
             modelTotal -= modelStake[i];
             modelStake[i] = 0;
-            ++distributionChanges;
         }
+    }
+
+    function _closeStakeInterval() private {
+        // Divide once per distribution, regardless of how often the contract checkpointed or changed rate.
+        if (modelTotal != 0) {
+            uint256 intervalEmission = modelEmitted - emissionAtStakeChange;
+            discardedScaledPoints += mulmod(intervalEmission, staking.ACC_PRECISION(), modelTotal);
+        }
+        emissionAtStakeChange = modelEmitted;
+        ++distributionChanges;
     }
 }
 
@@ -120,13 +145,14 @@ contract TestStakingInvariantTest is StdInvariant, Test {
             token.transfer(handler.actors(i), handler.ALLOCATION());
         }
         token.transfer(address(handler), handler.ALLOCATION());
-        bytes4[] memory selectors = new bytes4[](6);
+        bytes4[] memory selectors = new bytes4[](7);
         selectors[0] = StakingHandler.stake.selector;
         selectors[1] = StakingHandler.withdraw.selector;
         selectors[2] = StakingHandler.advance.selector;
         selectors[3] = StakingHandler.setRate.selector;
         selectors[4] = StakingHandler.checkpoint.selector;
         selectors[5] = StakingHandler.donate.selector;
+        selectors[6] = StakingHandler.transfer.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -137,7 +163,7 @@ contract TestStakingInvariantTest is StdInvariant, Test {
             address actor = handler.actors(i);
             uint256 staked = staking.stakes(actor);
             assertEq(staked, handler.modelStake(i));
-            assertEq(token.balanceOf(actor) + staked, handler.ALLOCATION());
+            assertEq(token.balanceOf(actor) + staked, handler.modelHoldings(i));
             sum += staked;
         }
         assertEq(sum, staking.totalStaked());
@@ -177,10 +203,28 @@ contract TestStakingInvariantTest is StdInvariant, Test {
         else assertLt(staking.globalRemainder(), staking.totalStaked());
     }
 
+    function invariant_everyFractionOfCheckpointedEmissionIsAccountedFor() public view {
+        uint256 precision = staking.ACC_PRECISION();
+        uint256 index = staking.accPointsPerToken();
+        uint256 allocated;
+        for (uint256 i; i < 4; ++i) {
+            address actor = handler.actors(i);
+            allocated += staking.earnedPoints(actor) * precision + staking.userPointRemainder(actor);
+            // Accrual at the saved global index that the account has yet to checkpoint.
+            allocated += handler.modelStake(i) * (index - staking.userPointsPerTokenPaid(actor));
+        }
+        assertEq(
+            allocated + staking.globalRemainder() + handler.discardedScaledPoints(),
+            staking.totalPointsEmitted() * precision,
+            "fractional points missing or counted twice"
+        );
+    }
+
     function afterInvariant() public {
         handler.exitAll();
         invariant_principalIsFullyBackedAndConserved();
         invariant_pointsMatchIndependentIntervalModelAndConserveEmission();
+        invariant_everyFractionOfCheckpointedEmissionIsAccountedFor();
         assertEq(staking.totalStaked(), 0);
         assertEq(token.balanceOf(address(staking)), handler.donations());
     }

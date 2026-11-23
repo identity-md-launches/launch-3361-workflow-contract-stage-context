@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {WalletGas} from "./helpers/WalletGas.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {LaunchToken} from "../src/LaunchToken.sol";
 import {TestStaking} from "../src/TestStaking.sol";
 
-contract TestStakingTest is Test {
+contract TestStakingTest is WalletGas {
     LaunchToken internal token;
     TestStaking internal staking;
     address internal owner = makeAddr("owner");
@@ -283,6 +283,40 @@ contract TestStakingTest is Test {
         assertEq(staking.totalStaked(), 0);
     }
 
+    function test_failedTopUpPreservesAllowanceAndOldSharesUntilRetry() public {
+        _stake(alice, 1);
+        _stake(bob, 1);
+        uint256 topUp = ALLOCATION - 1;
+        skip(2);
+
+        vm.startPrank(alice);
+        token.approve(address(staking), topUp);
+        token.transfer(carol, 1);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, alice, topUp - 1, topUp));
+        staking.stake(topUp);
+        vm.stopPrank();
+
+        assertEq(token.allowance(alice, address(staking)), topUp);
+        assertEq(token.balanceOf(address(staking)), 2);
+        assertEq(staking.totalStaked(), 2);
+        assertEq(staking.stakes(alice), 1);
+        assertEq(staking.earnedPoints(alice), 0);
+        assertEq(staking.pendingPoints(alice), 1 ether);
+
+        vm.prank(carol);
+        token.transfer(alice, 1);
+        skip(4);
+        vm.prank(alice);
+        staking.stake(topUp);
+        assertEq(token.allowance(alice, address(staking)), 0);
+        assertEq(staking.earnedPoints(alice), 3 ether);
+        assertEq(staking.pendingPoints(bob), 3 ether);
+        assertEq(staking.stakes(alice), ALLOCATION);
+        _withdraw(alice, ALLOCATION);
+        assertEq(token.balanceOf(alice), ALLOCATION);
+        assertEq(token.balanceOf(address(staking)), 1);
+    }
+
     function test_directDonationsDoNotCreateStakeOrDilutePoints() public {
         _stake(alice, 1 ether);
         skip(10);
@@ -337,6 +371,46 @@ contract TestStakingTest is Test {
         assertEq(staking.pendingPoints(bob), 11);
     }
 
+    function test_ratePauseAfterOneOfSevenPointUnitsEmitted() public {
+        _checkRatePause(1, 6, 1);
+    }
+
+    function testFuzz_ratePausePreservesEachHoldersExactShare(uint256 a, uint256 b, uint256 split) public {
+        a = bound(a, 1, 1 ether);
+        b = bound(b, 1, 1 ether);
+        _checkRatePause(a, b, bound(split, 1, a + b - 1));
+    }
+
+    function _checkRatePause(uint256 a, uint256 b, uint256 split) internal {
+        _rate(split);
+        _stake(alice, a);
+        _stake(bob, b);
+        skip(1);
+        vm.prank(alice);
+        uint256 saved = staking.checkpoint();
+        _rate(0);
+        skip(1 days);
+        assertEq(staking.currentTotalPointsEmitted(), split);
+        assertEq(staking.pendingPoints(alice), saved);
+
+        // The two emitting periods together produce exactly one point minor unit per staked minor unit.
+        _rate(a + b - split);
+        skip(1);
+        assertEq(staking.currentTotalPointsEmitted(), a + b);
+        _checkIntegralCheckpoint(alice, a);
+        _checkIntegralCheckpoint(bob, b);
+    }
+
+    function _checkIntegralCheckpoint(address actor, uint256 points) internal {
+        assertEq(staking.pendingPoints(actor), points);
+        vm.expectEmit(true, false, false, true, address(staking));
+        emit TestStaking.PointsCheckpointed(actor, points);
+        vm.prank(actor);
+        assertEq(staking.checkpoint(), points);
+        assertEq(staking.earnedPoints(actor), points);
+        assertEq(staking.userPointRemainder(actor), 0);
+    }
+
     function test_oldGlobalDustIsDiscardedOnDistributionChange() public {
         _rate(1);
         _stake(alice, 3);
@@ -372,6 +446,50 @@ contract TestStakingTest is Test {
         assertEq(vault.pendingPoints(address(this)), 1 ether);
         vault.withdraw(1e27);
         assertEq(full.balanceOf(address(this)), 1e27);
+    }
+
+    function test_lateEntryToSupplyCapAfterOneWeiEarnedAtMaxRate() public {
+        LaunchToken full = new LaunchToken();
+        TestStaking vault = new TestStaking(address(full), address(this));
+        uint256 supply = full.totalSupply();
+        uint256 rate = vault.MAX_POINTS_PER_SECOND();
+        vault.setPointsPerSecond(rate);
+        full.transfer(alice, 1);
+        vm.startPrank(alice);
+        full.approve(address(vault), 1);
+        vault.stake(1);
+        vm.stopPrank();
+        skip(1);
+
+        full.approve(address(vault), supply - 1);
+        vault.stake(supply - 1);
+        assertEq(vault.totalStaked(), supply);
+        assertEq(vault.pendingPoints(address(this)), 0);
+        assertEq(vault.pendingPoints(alice), rate);
+        vm.expectRevert(TestStaking.StakeLimitExceeded.selector);
+        vault.stake(1);
+
+        // The next 1,000 seconds at the maximum rate emit exactly 10^27 point minor units.
+        skip(1_000);
+        vault.withdraw(supply - 1);
+        vm.prank(alice);
+        vault.withdraw(1);
+        assertEq(vault.earnedPoints(address(this)), supply - 1);
+        assertEq(vault.earnedPoints(alice), rate + 1);
+        assertEq(vault.totalPointsEmitted(), supply + rate);
+        assertEq(vault.totalStaked(), 0);
+        assertEq(full.balanceOf(address(this)), supply - 1);
+        assertEq(full.balanceOf(alice), 1);
+    }
+
+    function test_stakeAndWithdrawAtWalletGasCheckpointAndTransfer() public {
+        _stake(alice, 5 ether);
+        _stake(bob, 2 ether);
+        skip(19);
+        vm.prank(alice);
+        token.approve(address(staking), 3 ether);
+        assertSameAtWalletGas(alice, address(staking), abi.encodeCall(TestStaking.stake, (3 ether)));
+        assertSameAtWalletGas(alice, address(staking), abi.encodeCall(TestStaking.withdraw, (5 ether)));
     }
 
     function test_nativeEthIsNotAccepted() public {
