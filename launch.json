@@ -1,0 +1,22 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "Test",
+    "symbol": "TEST",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "TestStaking",
+      "constructorArgs": ["$token", "$owner"]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "TestStaking holds deposited TEST and credits stakers in proportion to their share of the total stake. The initial rate is one point per second across all stakers. Points accrue only while TEST is staked. The launch owner can adjust the rate."
+}
